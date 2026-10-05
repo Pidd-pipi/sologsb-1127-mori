@@ -1,5 +1,7 @@
 import type { Inspection, InspectionConclusion, OccupiedLevel } from '../types/inspection';
 import type { RouteSegment, RouteVerdict } from '../types/route';
+import type { PointVerifyState } from './pointVerify';
+import { judgePoint } from './pointVerify';
 
 /** 阈值常量：依据《无障碍设计规范》常用核验口径 */
 export const SLOPE_PASS = 5; // 坡度 ≤ 5% 为合格
@@ -70,13 +72,22 @@ export function judgeSegment(seg: Pick<RouteSegment, 'curbHeight' | 'stepCount' 
   return { passable: reasons.length === 0, reasons };
 }
 
-/** 全线判定：逐段判定后汇总 */
+type VerdictSegment = Pick<
+  RouteSegment,
+  'curbHeight' | 'stepCount' | 'obstacleCount' | 'length' | 'order' | 'fromPointId' | 'toPointId'
+>;
+
+/**
+ * 全线判定：
+ * 1. 逐段判定路段自填字段（路缘高差 / 台阶 / 障碍数）；
+ * 2. 叠加沿途点位最新核验版本（不合格 / 复发阻断，限期整改 / 待整改告警）；
+ * 3. 任一项阻断即不可通行。
+ */
 export function buildVerdict(
   routeName: string,
-  segments: Pick<
-    RouteSegment,
-    'curbHeight' | 'stepCount' | 'obstacleCount' | 'length' | 'order' | 'fromPointId' | 'toPointId'
-  >[],
+  segments: VerdictSegment[],
+  pointStates?: Map<string, PointVerifyState>,
+  pointNameOf?: (id: string) => string,
 ): RouteVerdict {
   const ordered = [...segments].sort((a, b) => a.order - b.order);
   const totalLength = Math.round(ordered.reduce((n, s) => n + (Number(s.length) || 0), 0) * 10) / 10;
@@ -84,12 +95,35 @@ export function buildVerdict(
   const totalSteps = ordered.reduce((n, s) => n + (Number(s.stepCount) || 0), 0);
   const maxCurbHeight = ordered.reduce((n, s) => Math.max(n, Number(s.curbHeight) || 0), 0);
   const reasons: string[] = [];
+  const warnings: string[] = [];
   ordered.forEach((s) => {
     const r = judgeSegment(s);
     if (!r.passable) {
       reasons.push(`第 ${s.order} 段：${r.reasons.join('；')}`);
     }
   });
+
+  if (pointStates) {
+    const labelOf = (id: string) => (pointNameOf ? pointNameOf(id) : id);
+    // 沿途点位按顺序去重（相邻段共享衔接点）
+    const chain: string[] = [];
+    ordered.forEach((s, i) => {
+      if (i === 0) chain.push(s.fromPointId);
+      chain.push(s.toPointId);
+    });
+    const seen = new Set<string>();
+    for (const id of chain) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const state = pointStates.get(id);
+      if (!state) continue;
+      const access = judgePoint(state);
+      const head = `点位「${labelOf(id)}」`;
+      if (!access.passable && access.reason) reasons.push(`${head}：${access.reason}`);
+      if (access.warning) warnings.push(`${head}：${access.warning}`);
+    }
+  }
+
   return {
     routeName,
     passable: reasons.length === 0 && ordered.length > 0,
@@ -98,5 +132,6 @@ export function buildVerdict(
     totalSteps,
     maxCurbHeight,
     reasons: ordered.length === 0 ? ['尚未串联路段'] : reasons,
+    warnings,
   };
 }

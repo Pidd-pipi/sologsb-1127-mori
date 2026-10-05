@@ -1,10 +1,11 @@
 import Dexie, { type Table } from 'dexie';
 import type { AccessPoint } from '../types/point';
 import type { Inspection } from '../types/inspection';
-import type { RouteSegment } from '../types/route';
+import type { RouteDef, RouteSegment } from '../types/route';
 import type { RectifyPlan } from '../types/rectify';
 import { addDays, makeId, todayStr, toPlain } from '../utils/format';
-import { judgeInspection } from '../utils/routeCheck';
+import { buildVerifyStates } from '../utils/pointVerify';
+import { buildVerdict, judgeInspection } from '../utils/routeCheck';
 
 export const DB_NAME = 'gbaccessmap-db';
 
@@ -13,11 +14,13 @@ export const DB_NAME = 'gbaccessmap-db';
  * v1 建 points / inspections
  * v2 加 routes 表与 pointId 索引
  * v3 加 rectifies 表，并为历史不合格核验补建整改条目
+ * v4 加 routeDefs 表：路线绑定沿途点位核验版本；旧路线升级为「待复核」并冻结原判定
  */
 class AccessMapDb extends Dexie {
   points!: Table<AccessPoint, string>;
   inspections!: Table<Inspection, string>;
   routes!: Table<RouteSegment, string>;
+  routeDefs!: Table<RouteDef, string>;
   rectifies!: Table<RectifyPlan, string>;
 
   constructor() {
@@ -70,6 +73,72 @@ class AccessMapDb extends Dexie {
             status: '待整改',
             createdAt: new Date().toISOString(),
           });
+        }
+      });
+    this.version(4)
+      .stores({
+        points: 'id, code, facilityType, district, name',
+        inspections: 'id, pointId, date, conclusion',
+        routes: 'id, routeId, routeName, fromPointId, toPointId, order',
+        routeDefs: 'id, name, status, updatedAt',
+        rectifies: 'id, pointId, status, deadline',
+      })
+      .upgrade(async (tx) => {
+        // v4：路线绑定点位核验版本。
+        // 1) 为历史整改条目补 updatedAt（已复检取复检日期）；
+        const rectTable = tx.table<RectifyPlan, string>('rectifies');
+        const rectRows = await rectTable.toArray();
+        for (const r of rectRows) {
+          if (!r.updatedAt) {
+            await rectTable.update(r.id, { updatedAt: r.recheckDate || '' });
+          }
+        }
+
+        // 2) 每个历史路线名生成一个路线定义，状态置「待复核」，
+        //    冻结升级前仅按路段字段判定的原结论，复核完成前不得发布。
+        const routeTable = tx.table<RouteSegment, string>('routes');
+        const defTable = tx.table<RouteDef, string>('routeDefs');
+        const inspRows: Inspection[] = await tx.table('inspections').toArray();
+        const allRectRows: RectifyPlan[] = await rectTable.toArray();
+        const segRows: RouteSegment[] = await routeTable.toArray();
+        const now = new Date().toISOString();
+
+        const byName = new Map<string, RouteSegment[]>();
+        for (const seg of segRows) {
+          const name = seg.routeName || '未命名路线';
+          const list = byName.get(name) ?? [];
+          list.push(seg);
+          byName.set(name, list);
+        }
+        for (const [name, list] of byName) {
+          const ordered = [...list].sort((a, b) => a.order - b.order);
+          const chain = ordered.length
+            ? [ordered[0].fromPointId, ...ordered.map((s) => s.toPointId)]
+            : [];
+          const states = buildVerifyStates(chain, inspRows, allRectRows);
+          // 衔接点位可能重复（如往返路线），快照按点位去重
+          const seenSnap = new Set<string>();
+          const snapshots = chain
+            .filter((id) => !seenSnap.has(id) && seenSnap.add(id))
+            .map((id) => toPlain(states.get(id)!));
+          // 冻结的是旧口径原判定：只看路段自填字段，不叠加点位核验
+          const originalVerdict = buildVerdict(name, ordered);
+          const routeId = `rtd-legacy-${makeId('x')}`;
+          const def: RouteDef = {
+            id: routeId,
+            name,
+            chain,
+            pointSnapshots: snapshots,
+            status: '待复核',
+            storedVerdict: JSON.stringify(originalVerdict),
+            legacy: true,
+            createdAt: ordered[0]?.createdAt ?? now,
+            updatedAt: now,
+          };
+          await defTable.add(def);
+          for (const seg of ordered) {
+            await routeTable.update(seg.id, { routeId, routeName: name });
+          }
         }
       });
   }
@@ -280,22 +349,46 @@ const SEED_INSPECTIONS: SeedInspection[] = [
 ];
 
 interface SeedRoute {
+  routeId: string;
   routeName: string;
   pointIds: string[];
   length: number;
   obstacleCount: number;
   stepCount: number;
   curbHeight: number;
+  /** true 表示升级口径前的旧路线：冻结原判定、待复核、不可发布 */
+  legacy?: boolean;
 }
 
 const SEED_ROUTES: SeedRoute[] = [
   {
+    routeId: 'rtd-seed-1',
     routeName: '东单—王府井轮椅通道',
     pointIds: ['pt-1001', 'pt-1002'],
     length: 640.5,
     obstacleCount: 1,
     stepCount: 0,
     curbHeight: 2,
+  },
+  {
+    routeId: 'rtd-seed-2',
+    routeName: '西直门—中关村无障碍接驳线',
+    pointIds: ['pt-1003', 'pt-1005'],
+    length: 1520,
+    obstacleCount: 0,
+    stepCount: 0,
+    curbHeight: 2,
+  },
+  {
+    // 旧口径路线：途经 pt-1007（核验不合格且待整改），路段字段却显示可通行
+    routeId: 'rtd-seed-3',
+    routeName: '莲花池东路旧轮椅通道',
+    pointIds: ['pt-1007', 'pt-1008'],
+    length: 480,
+    obstacleCount: 1,
+    stepCount: 0,
+    curbHeight: 2,
+    legacy: true,
   },
 ];
 
@@ -326,11 +419,18 @@ function buildSeed() {
       createdAt: now,
     };
   });
+  const stateByPoint = buildVerifyStates(
+    SEED_POINTS.map((p) => p.id),
+    inspections,
+    [], // 整改条目在下方构建，快照只绑定核验版本；首装演示路线状态由前端实时派生
+  );
   const routes: RouteSegment[] = [];
+  const routeDefs: RouteDef[] = [];
   SEED_ROUTES.forEach((r, ri) => {
     for (let i = 1; i < r.pointIds.length; i += 1) {
       routes.push({
         id: `rts-seed-${ri + 1}-${i}`,
+        routeId: r.routeId,
         routeName: r.routeName,
         fromPointId: r.pointIds[i - 1],
         toPointId: r.pointIds[i],
@@ -343,6 +443,26 @@ function buildSeed() {
         createdAt: now,
       });
     }
+    const ownSegments = routes.filter((x) => x.routeId === r.routeId);
+    const snapshots = r.pointIds.map((id) => toPlain(stateByPoint.get(id)!));
+    // 旧路线冻结旧口径原判定，新路线按绑定核验版本的完整口径判定
+    const verdict = buildVerdict(
+      r.routeName,
+      ownSegments,
+      r.legacy ? undefined : stateByPoint,
+      (id) => SEED_POINTS.find((p) => p.id === id)?.name ?? id,
+    );
+    routeDefs.push({
+      id: r.routeId,
+      name: r.routeName,
+      chain: [...r.pointIds],
+      pointSnapshots: snapshots,
+      status: r.legacy ? '待复核' : '有效',
+      storedVerdict: JSON.stringify(verdict),
+      legacy: Boolean(r.legacy),
+      createdAt: now,
+      updatedAt: now,
+    });
   });
   const rectifies: RectifyPlan[] = [
     {
@@ -354,6 +474,7 @@ function buildSeed() {
       recheckDate: '',
       status: '待整改',
       createdAt: now,
+      updatedAt: '',
     },
     {
       id: 'rct-seed-2',
@@ -364,6 +485,7 @@ function buildSeed() {
       recheckDate: '',
       status: '待整改',
       createdAt: now,
+      updatedAt: '',
     },
     {
       id: 'rct-seed-3',
@@ -374,6 +496,7 @@ function buildSeed() {
       recheckDate: '',
       status: '待整改',
       createdAt: now,
+      updatedAt: '',
     },
     {
       id: 'rct-seed-4',
@@ -384,9 +507,20 @@ function buildSeed() {
       recheckDate: addDays(today, -12),
       status: '已整改',
       createdAt: now,
+      updatedAt: addDays(today, -12),
     },
   ];
-  return { points, inspections, routes, rectifies };
+  // 首装时重新用含整改条目的数据生成一次新路线快照（含待整改版本绑定）
+  const fullStates = buildVerifyStates(
+    SEED_POINTS.map((p) => p.id),
+    inspections,
+    rectifies,
+  );
+  for (const def of routeDefs) {
+    if (def.legacy) continue;
+    def.pointSnapshots = def.chain.map((id) => toPlain(fullStates.get(id)!));
+  }
+  return { points, inspections, routes, routeDefs, rectifies };
 }
 
 /** 首次打开时写入示例数据；已有数据则跳过 */
@@ -394,12 +528,21 @@ export async function ensureSeed(): Promise<void> {
   const count = await db.points.count();
   if (count > 0) return;
   const seed = toPlain(buildSeed());
-  await db.transaction('rw', db.points, db.inspections, db.routes, db.rectifies, async () => {
-    await db.points.bulkPut(seed.points);
-    await db.inspections.bulkPut(seed.inspections);
-    await db.routes.bulkPut(seed.routes);
-    await db.rectifies.bulkPut(seed.rectifies);
-  });
+  await db.transaction(
+    'rw',
+    db.points,
+    db.inspections,
+    db.routes,
+    db.routeDefs,
+    db.rectifies,
+    async () => {
+      await db.points.bulkPut(seed.points);
+      await db.inspections.bulkPut(seed.inspections);
+      await db.routes.bulkPut(seed.routes);
+      await db.routeDefs.bulkPut(seed.routeDefs);
+      await db.rectifies.bulkPut(seed.rectifies);
+    },
+  );
 }
 
 export { makeId };

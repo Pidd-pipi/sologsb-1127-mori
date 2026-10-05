@@ -4,6 +4,7 @@ import type { AccessPoint, AccessPointDraft } from '../types/point';
 import type { Inspection, InspectionDraft } from '../types/inspection';
 import type { RectifyPlan, RectifyPlanDraft } from '../types/rectify';
 import { makeId, toPlain, todayStr } from '../utils/format';
+import { broadcastData, onDataSignal } from '../utils/channels';
 
 interface PointState {
   points: AccessPoint[];
@@ -20,6 +21,11 @@ interface PointState {
   getPoint: (id: string) => AccessPoint | undefined;
   inspectionsOf: (pointId: string) => Inspection[];
   rectifiesOf: (pointId: string) => RectifyPlan[];
+}
+
+/** 核验 / 复检数据变化：通知其它标签页，绑定该点位的路线需立即失效重算 */
+function notifyPointDataChanged() {
+  broadcastData('point-data-changed');
 }
 
 export const usePointStore = create<PointState>((set, get) => ({
@@ -90,6 +96,7 @@ export const usePointStore = create<PointState>((set, get) => ({
         });
       }
     }
+    notifyPointDataChanged();
     return inspection;
   },
 
@@ -98,20 +105,23 @@ export const usePointStore = create<PointState>((set, get) => ({
       ...draft,
       id: makeId('rct'),
       createdAt: new Date().toISOString(),
+      updatedAt: '',
     });
     await db.rectifies.put(plan);
     set((s) => ({
       rectifies: [...s.rectifies, plan].sort((a, b) => (a.deadline < b.deadline ? -1 : 1)),
     }));
+    notifyPointDataChanged();
     return plan;
   },
 
   updateRectify: async (id, patch) => {
-    const plain = toPlain(patch);
+    const plain = toPlain({ ...patch, updatedAt: new Date().toISOString() });
     await db.rectifies.update(id, plain);
     set((s) => ({
       rectifies: s.rectifies.map((r) => (r.id === id ? { ...r, ...plain } : r)),
     }));
+    notifyPointDataChanged();
   },
 
   getPoint: (id) => get().points.find((p) => p.id === id),
@@ -126,3 +136,13 @@ export const usePointStore = create<PointState>((set, get) => ({
       .rectifies.filter((r) => r.pointId === pointId)
       .sort((a, b) => (a.deadline < b.deadline ? -1 : 1)),
 }));
+
+/**
+ * 跨标签页：其它页签补录核验或登记复检后，本页签点位数据即时刷新，
+ * 路线页据此立即把相关路线判为失效并按最新核验重算。
+ */
+onDataSignal((signal) => {
+  if (signal.kind !== 'point-data-changed') return;
+  if (!usePointStore.getState().loaded) return;
+  void usePointStore.getState().load();
+});

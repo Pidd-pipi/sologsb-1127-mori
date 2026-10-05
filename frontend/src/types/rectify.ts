@@ -17,9 +17,11 @@ export interface RectifyPlan {
   recheckDate: string;
   status: RectifyStatus;
   createdAt: string;
+  /** 最近一次复检登记时间，未复检为空字符串 */
+  updatedAt: string;
 }
 
-export type RectifyPlanDraft = Omit<RectifyPlan, 'id' | 'createdAt'>;
+export type RectifyPlanDraft = Omit<RectifyPlan, 'id' | 'createdAt' | 'updatedAt'>;
 
 /** 按状态与期限分组后的清单结构 */
 export interface RectifyGroup {
