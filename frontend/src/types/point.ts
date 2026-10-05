@@ -45,8 +45,13 @@ export interface AccessPoint {
   /** 建成年代 */
   builtYear: number;
   maintainUnit: string;
+  /**
+   * 核验版本号：每次新增核验、或整改复检状态变化（如复发）时 +1。
+   * 通行路线按该版本绑定沿途点位，版本不一致即判定路线失效待复核。
+   */
+  inspectionVersion: number;
   createdAt: string;
   updatedAt: string;
 }
 
-export type AccessPointDraft = Omit<AccessPoint, 'id' | 'createdAt' | 'updatedAt'>;
+export type AccessPointDraft = Omit<AccessPoint, 'id' | 'createdAt' | 'updatedAt' | 'inspectionVersion'>;

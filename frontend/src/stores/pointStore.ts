@@ -56,6 +56,7 @@ export const usePointStore = create<PointState>((set, get) => ({
     const point: AccessPoint = toPlain({
       ...draft,
       id: makeId('pt'),
+      inspectionVersion: 0,
       createdAt: now,
       updatedAt: now,
     });
@@ -70,9 +71,25 @@ export const usePointStore = create<PointState>((set, get) => ({
       id: makeId('ins'),
       createdAt: new Date().toISOString(),
     });
-    await db.inspections.put(inspection);
+    // 同一事务内写入核验并递增点位核验版本：
+    // 绑定该点位的路线会因版本不一致立即失效待复核
+    await db.transaction('rw', db.inspections, db.points, async () => {
+      await db.inspections.put(inspection);
+      const point = await db.points.get(inspection.pointId);
+      if (point) {
+        await db.points.update(inspection.pointId, {
+          inspectionVersion: (point.inspectionVersion ?? 0) + 1,
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    });
     set((s) => ({
       inspections: [inspection, ...s.inspections].sort((a, b) => (a.date < b.date ? 1 : -1)),
+      points: s.points.map((p) =>
+        p.id === inspection.pointId
+          ? { ...p, inspectionVersion: (p.inspectionVersion ?? 0) + 1, updatedAt: new Date().toISOString() }
+          : p,
+      ),
     }));
     // 结论为不合格时自动生成整改条目，形成闭环
     if (inspection.conclusion === '不合格') {
@@ -108,9 +125,35 @@ export const usePointStore = create<PointState>((set, get) => ({
 
   updateRectify: async (id, patch) => {
     const plain = toPlain(patch);
-    await db.rectifies.update(id, plain);
+    // 复检状态变化（如整改复发）同样改变点位通行状态，递增核验版本让相关路线失效
+    const current = get().rectifies.find((r) => r.id === id);
+    const statusChanged = Boolean(plain.status && current && plain.status !== current.status);
+    await db.transaction('rw', db.rectifies, db.points, async () => {
+      await db.rectifies.update(id, plain);
+      if (statusChanged && current) {
+        const point = await db.points.get(current.pointId);
+        if (point) {
+          await db.points.update(current.pointId, {
+            inspectionVersion: (point.inspectionVersion ?? 0) + 1,
+            updatedAt: new Date().toISOString(),
+          });
+        }
+      }
+    });
     set((s) => ({
       rectifies: s.rectifies.map((r) => (r.id === id ? { ...r, ...plain } : r)),
+      points:
+        statusChanged && current
+          ? s.points.map((p) =>
+              p.id === current.pointId
+                ? {
+                    ...p,
+                    inspectionVersion: (p.inspectionVersion ?? 0) + 1,
+                    updatedAt: new Date().toISOString(),
+                  }
+                : p,
+            )
+          : s.points,
     }));
   },
 

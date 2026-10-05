@@ -5,6 +5,7 @@ import type { RouteSegment } from '../types/route';
 import type { RectifyPlan } from '../types/rectify';
 import { addDays, makeId, todayStr, toPlain } from '../utils/format';
 import { judgeInspection } from '../utils/routeCheck';
+import { snapshotPoints } from '../utils/routeVersion';
 
 export const DB_NAME = 'gbaccessmap-db';
 
@@ -13,6 +14,8 @@ export const DB_NAME = 'gbaccessmap-db';
  * v1 建 points / inspections
  * v2 加 routes 表与 pointId 索引
  * v3 加 rectifies 表，并为历史不合格核验补建整改条目
+ * v4 点位加核验版本号，路线段加版本/复核状态/点位核验快照；
+ *    历史路线标记「待复核」，复核完成前不作为可发布路线
  */
 class AccessMapDb extends Dexie {
   points!: Table<AccessPoint, string>;
@@ -72,12 +75,56 @@ class AccessMapDb extends Dexie {
           });
         }
       });
+    this.version(4)
+      .stores({
+        points: 'id, code, facilityType, district, name',
+        inspections: 'id, pointId, date, conclusion',
+        routes: 'id, routeName, fromPointId, toPointId, order',
+        rectifies: 'id, pointId, status, deadline',
+      })
+      .upgrade(async (tx) => {
+        // v4-1：点位核验版本号 = 历史核验条数（之后每新增核验/复检状态变化再 +1）
+        const inspections: Inspection[] = await tx.table('inspections').toArray();
+        const rectifies: RectifyPlan[] = await tx.table('rectifies').toArray();
+        const points: AccessPoint[] = await tx.table('points').toArray();
+        const versionByPoint = new Map<string, number>();
+        for (const insp of inspections) {
+          versionByPoint.set(insp.pointId, (versionByPoint.get(insp.pointId) ?? 0) + 1);
+        }
+        const versioned = points.map((p) => ({
+          ...p,
+          inspectionVersion: versionByPoint.get(p.id) ?? 0,
+        }));
+        for (const p of versioned) {
+          await tx.table('points').update(p.id, { inspectionVersion: p.inspectionVersion });
+        }
+        // v4-2：历史路线记录当前点位核验快照并标记「待复核」，
+        //       原判定保留可查，但复核完成前不作为可发布路线
+        const routes: RouteSegment[] = await tx.table('routes').toArray();
+        const byName = new Map<string, RouteSegment[]>();
+        for (const seg of routes) {
+          const list = byName.get(seg.routeName) ?? [];
+          list.push(seg);
+          byName.set(seg.routeName, list);
+        }
+        for (const segs of byName.values()) {
+          const pointIds = [...new Set(segs.flatMap((s) => [s.fromPointId, s.toPointId]))];
+          const pointSnapshots = snapshotPoints(versioned, inspections, rectifies, pointIds);
+          for (const seg of segs) {
+            await tx.table('routes').update(seg.id, {
+              revision: 1,
+              reviewStatus: '待复核',
+              pointSnapshots,
+            });
+          }
+        }
+      });
   }
 }
 
 export const db = new AccessMapDb();
 
-const SEED_POINTS: Omit<AccessPoint, 'createdAt' | 'updatedAt'>[] = [
+const SEED_POINTS: Omit<AccessPoint, 'createdAt' | 'updatedAt' | 'inspectionVersion'>[] = [
   {
     id: 'pt-1001',
     code: 'WZ-2024-001',
@@ -302,7 +349,17 @@ const SEED_ROUTES: SeedRoute[] = [
 function buildSeed() {
   const now = new Date().toISOString();
   const today = todayStr();
-  const points: AccessPoint[] = SEED_POINTS.map((p) => ({ ...p, createdAt: now, updatedAt: now }));
+  // 点位核验版本号 = 示例核验条数（每个示例点位各 1 条）
+  const versionByPoint = new Map<string, number>();
+  for (const s of SEED_INSPECTIONS) {
+    versionByPoint.set(s.pointId, (versionByPoint.get(s.pointId) ?? 0) + 1);
+  }
+  const points: AccessPoint[] = SEED_POINTS.map((p) => ({
+    ...p,
+    inspectionVersion: versionByPoint.get(p.id) ?? 0,
+    createdAt: now,
+    updatedAt: now,
+  }));
   const inspections: Inspection[] = SEED_INSPECTIONS.map((s, i) => {
     const judged = judgeInspection({
       slope: s.slope,
@@ -325,24 +382,6 @@ function buildSeed() {
       problem: s.problem,
       createdAt: now,
     };
-  });
-  const routes: RouteSegment[] = [];
-  SEED_ROUTES.forEach((r, ri) => {
-    for (let i = 1; i < r.pointIds.length; i += 1) {
-      routes.push({
-        id: `rts-seed-${ri + 1}-${i}`,
-        routeName: r.routeName,
-        fromPointId: r.pointIds[i - 1],
-        toPointId: r.pointIds[i],
-        length: Math.round((r.length / (r.pointIds.length - 1)) * 10) / 10,
-        obstacleCount: r.obstacleCount,
-        stepCount: r.stepCount,
-        curbHeight: r.curbHeight,
-        wheelchairPassable: r.stepCount === 0 && r.curbHeight <= 3 && r.obstacleCount <= 2,
-        order: i,
-        createdAt: now,
-      });
-    }
   });
   const rectifies: RectifyPlan[] = [
     {
@@ -386,6 +425,29 @@ function buildSeed() {
       createdAt: now,
     },
   ];
+  const routes: RouteSegment[] = [];
+  SEED_ROUTES.forEach((r, ri) => {
+    // 示例路线基于当前核验数据编制：记录点位快照并标记已复核（可发布）
+    const pointSnapshots = snapshotPoints(points, inspections, rectifies, r.pointIds);
+    for (let i = 1; i < r.pointIds.length; i += 1) {
+      routes.push({
+        id: `rts-seed-${ri + 1}-${i}`,
+        routeName: r.routeName,
+        fromPointId: r.pointIds[i - 1],
+        toPointId: r.pointIds[i],
+        length: Math.round((r.length / (r.pointIds.length - 1)) * 10) / 10,
+        obstacleCount: r.obstacleCount,
+        stepCount: r.stepCount,
+        curbHeight: r.curbHeight,
+        wheelchairPassable: r.stepCount === 0 && r.curbHeight <= 3 && r.obstacleCount <= 2,
+        order: i,
+        revision: 1,
+        reviewStatus: '已复核',
+        pointSnapshots,
+        createdAt: now,
+      });
+    }
+  });
   return { points, inspections, routes, rectifies };
 }
 

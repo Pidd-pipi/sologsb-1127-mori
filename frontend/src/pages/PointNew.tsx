@@ -113,6 +113,7 @@ export default function PointNew() {
       location: draft.location,
       builtYear: draft.builtYear,
       maintainUnit: draft.maintainUnit,
+      inspectionVersion: 0,
       createdAt: '',
       updatedAt: '',
     };

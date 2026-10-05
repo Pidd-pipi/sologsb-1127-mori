@@ -1,5 +1,5 @@
 import type { Inspection, InspectionConclusion, OccupiedLevel } from '../types/inspection';
-import type { RouteSegment, RouteVerdict } from '../types/route';
+import type { RoutePointState, RouteSegment, RouteVerdict } from '../types/route';
 
 /** 阈值常量：依据《无障碍设计规范》常用核验口径 */
 export const SLOPE_PASS = 5; // 坡度 ≤ 5% 为合格
@@ -70,13 +70,14 @@ export function judgeSegment(seg: Pick<RouteSegment, 'curbHeight' | 'stepCount' 
   return { passable: reasons.length === 0, reasons };
 }
 
-/** 全线判定：逐段判定后汇总 */
+/** 全线判定：逐段判定后，再叠加沿途点位的最新核验状态 */
 export function buildVerdict(
   routeName: string,
   segments: Pick<
     RouteSegment,
     'curbHeight' | 'stepCount' | 'obstacleCount' | 'length' | 'order' | 'fromPointId' | 'toPointId'
   >[],
+  pointStates: RoutePointState[] = [],
 ): RouteVerdict {
   const ordered = [...segments].sort((a, b) => a.order - b.order);
   const totalLength = Math.round(ordered.reduce((n, s) => n + (Number(s.length) || 0), 0) * 10) / 10;
@@ -90,6 +91,24 @@ export function buildVerdict(
       reasons.push(`第 ${s.order} 段：${r.reasons.join('；')}`);
     }
   });
+  const warnings: string[] = [];
+  for (const p of pointStates) {
+    if (p.conclusion === '不合格') {
+      reasons.push(`点位「${p.name}」最新核验结论为不合格`);
+    }
+    if (p.rectify === '复发') {
+      reasons.push(`点位「${p.name}」整改复发，尚未复检达标`);
+    }
+    if (p.conclusion === '限期整改') {
+      warnings.push(`点位「${p.name}」限期整改中，通行需留意`);
+    }
+    if (p.conclusion === '未核验') {
+      warnings.push(`点位「${p.name}」尚未核验`);
+    }
+    if (p.rectify === '待整改') {
+      warnings.push(`点位「${p.name}」存在待整改条目`);
+    }
+  }
   return {
     routeName,
     passable: reasons.length === 0 && ordered.length > 0,
@@ -98,5 +117,6 @@ export function buildVerdict(
     totalSteps,
     maxCurbHeight,
     reasons: ordered.length === 0 ? ['尚未串联路段'] : reasons,
+    warnings,
   };
 }

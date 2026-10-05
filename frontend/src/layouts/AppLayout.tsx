@@ -35,6 +35,17 @@ export default function AppLayout() {
     void loadRoutes();
   }, [loadPoints, loadRoutes]);
 
+  // 其他页签写入核验/整改/路线后，本页签重新聚焦时刷新，
+  // 让路线失效状态与保存冲突校验基于最新数据
+  useEffect(() => {
+    const onFocus = () => {
+      void loadPoints();
+      void loadRoutes();
+    };
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
+  }, [loadPoints, loadRoutes]);
+
   const selectedKey =
     MENU.map((m) => m.key)
       .filter((k) => k !== '/' && location.pathname.startsWith(k))
